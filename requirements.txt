@@ -1,0 +1,4 @@
+requests
+pandas
+pyqt5
+pyinstaller

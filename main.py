@@ -1,0 +1,264 @@
+import sys
+import os
+import time
+import json
+from datetime import datetime
+
+import requests
+import pandas as pd
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit,
+                             QPushButton, QTextEdit, QFileDialog, QHBoxLayout, QMessageBox)
+from PyQt5.QtCore import QThread, pyqtSignal
+
+
+# ================= Tracker 后端逻辑 =================
+class Tracker(object):
+    def __init__(self, auth, cookie, host, username, usercode,
+                 interval, loop_interval, csv_filename, config_file):
+        self.path = os.path.dirname(os.path.abspath(__file__))
+        self.Authorization = auth
+        self.cookie = cookie
+        self.host = host
+        self.username = username
+        self.usercode = usercode
+        self.interval = interval
+        self.loop_interval = loop_interval
+        self.csv_filename = csv_filename
+        self.config_file = config_file
+
+        self.session = requests.Session()
+        self.headers = {
+            'Cookie': self.cookie,
+            'Authorization': self.Authorization,
+            'sysnum': "CXLP"
+        }
+        self.data = {
+            "userCodeSession": self.usercode,
+            "userNameSession": self.username,
+            "comCodeSession": "44030000"
+        }
+
+    def get_state(self, registNo, comcode):
+        url = f"http://{self.host}/claimcar/api/applicationLayer/piccclaim/newFrame/bpm/viewFlowChart"
+        headers = self.headers.copy()
+        headers["comcode"] = comcode
+        data = self.data.copy()
+        data["registNo"] = registNo
+        response = self.session.post(url, json=data, headers=headers)
+        response.encoding = "utf-8"
+        nodePKVoList = response.json()['data']['nodePKVoList']
+        nodePKVoList.sort(key=lambda x: x['wbusinessCmain']['indate'])
+        return nodePKVoList
+
+    def check_claims(self, nodePKVoList, old_index, new_index):
+        node_list = nodePKVoList[old_index:new_index]
+        results = [
+            item['nodeAddVo']['stat']
+            for item in node_list
+            if (isinstance(item, dict) and
+                'nodeAddVo' in item and
+                isinstance(item['nodeAddVo'], dict) and
+                'nodeName' in item['nodeAddVo'] and
+                '核赔' in str(item['nodeAddVo']['nodeName']) and
+                'stat' in item['nodeAddVo'])
+        ]
+        return "核赔完成" if results else None
+
+    def update_csv_data(self, logger=print):
+        dtype_mapping = {'报案号': str, 'comcode': str, '节点长度': str, '核赔节点是否有新增': str}
+        csv_path = self.csv_filename
+        df = pd.read_csv(csv_path, encoding='utf-8-sig', dtype=dtype_mapping)
+        updated = False
+        for index, row in df.iterrows():
+            registNo = str(row['报案号']).strip() if pd.notna(row['报案号']) else ''
+            comcode = str(row['comcode']).strip() if pd.notna(row['comcode']) else ''
+            current_length_str = str(row['节点长度']).strip() if pd.notna(row['节点长度']) else '0'
+            nodePKVoList = self.get_state(registNo, comcode)
+            new_length = len(nodePKVoList)
+            current_length = int(current_length_str) if current_length_str.isdigit() else 0
+            if new_length != current_length:
+                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列：{index} -- 报案号：{registNo} -- 机构代码：{comcode} -- 节点长度：{new_length}")
+                claims = self.check_claims(nodePKVoList, current_length, new_length)
+                df.loc[index] = {'报案号': registNo, 'comcode': comcode,
+                                 '节点长度': str(new_length), '核赔节点是否有新增': claims}
+                updated = True
+            else:
+                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列：{index} -- 报案号：{registNo} -- 机构代码：{comcode} -- 节点长度：无变化")
+            time.sleep(self.interval)
+
+        if updated:
+            try:
+                df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CSV文件已成功更新并保存！")
+                return True   # 有更新
+            except Exception as e:
+                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 保存文件时出错: {e}")
+        else:
+            logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 没有需要更新的数据")
+        return False
+
+
+# ================= 后台线程封装 =================
+class TrackerWorker(QThread):
+    log_signal = pyqtSignal(str)
+    alert_signal = pyqtSignal(str)  # 新增：触发主窗口弹窗
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.running = True
+
+    def log(self, msg):
+        self.log_signal.emit(msg)
+
+    def run(self):
+        try:
+            tracker = Tracker(
+                self.config['auth'],
+                self.config['cookie'],
+                self.config['host'],
+                self.config['username'],
+                self.config['usercode'],
+                int(self.config['interval']),
+                int(self.config['loop_interval']),
+                self.config['csv_filename'],
+                self.config['config_file']
+            )
+            while self.running:
+                updated = tracker.update_csv_data(self.log)
+                if updated:
+                    self.alert_signal.emit("监控文件有新的更新，请留意！")
+                self.log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 间隔{self.config['loop_interval']}秒后再次扫描监控表")
+                time.sleep(int(self.config['loop_interval']))
+        except Exception as e:
+            self.log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ❌ 程序错误: {str(e)}")
+
+    def stop(self):
+        self.running = False
+
+
+# ================= GUI 主窗口 =================
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("理赔监控工具")
+        self.resize(700, 600)
+
+        layout = QVBoxLayout()
+        self.inputs = {}
+
+        # 中文字段映射
+        fields = {
+            "host": "主机地址",
+            "cookie": "Cookie",
+            "auth": "授权码",
+            "username": "用户名",
+            "usercode": "用户代码",
+            "interval": "每条间隔秒数",
+            "loop_interval": "循环间隔秒数"
+        }
+
+        for key, label in fields.items():
+            hbox = QHBoxLayout()
+            hbox.addWidget(QLabel(label))
+            line_edit = QLineEdit()
+            hbox.addWidget(line_edit)
+            layout.addLayout(hbox)
+            self.inputs[key] = line_edit
+
+        # CSV 文件选择
+        hbox_csv = QHBoxLayout()
+        hbox_csv.addWidget(QLabel("监控文件 (CSV)"))
+        self.csv_edit = QLineEdit()
+        btn_csv = QPushButton("选择文件")
+        btn_csv.clicked.connect(self.choose_csv_file)
+        hbox_csv.addWidget(self.csv_edit)
+        hbox_csv.addWidget(btn_csv)
+        layout.addLayout(hbox_csv)
+        self.inputs["csv_filename"] = self.csv_edit
+
+        # 控制按钮
+        self.start_button = QPushButton("运行")
+        self.stop_button = QPushButton("停止")
+        layout.addWidget(self.start_button)
+        layout.addWidget(self.stop_button)
+
+        # 日志窗口
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+        self.setLayout(layout)
+
+        self.worker = None
+        self.start_button.clicked.connect(self.start_tracker)
+        self.stop_button.clicked.connect(self.stop_tracker)
+
+        # 程序启动时加载 config.json
+        self.config_path = os.path.join(os.path.dirname(sys.argv[0]), "config.json")
+        self.load_config_at_start()
+
+    def choose_csv_file(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择监控 CSV 文件", "", "CSV 文件 (*.csv)")
+        if file_name:
+            self.csv_edit.setText(file_name)
+
+    def save_config(self):
+        """保存配置到当前目录下的 config.json"""
+        cfg = {k: v.text().strip() for k, v in self.inputs.items()
+               if k in ["host", "username", "usercode", "interval", "loop_interval", "csv_filename"]}
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=4)
+            self.update_log("✅ 配置已保存 (config.json)")
+        except Exception as e:
+            self.update_log(f"❌ 保存配置失败: {e}")
+
+    def load_config_at_start(self):
+        """启动时自动加载 config.json"""
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                for k, v in cfg.items():
+                    if k in self.inputs:
+                        self.inputs[k].setText(str(v))
+                self.update_log("✅ 已自动加载上次保存的配置")
+            except Exception as e:
+                self.update_log(f"❌ 自动加载配置失败: {e}")
+
+    def start_tracker(self):
+        config = {k: v.text().strip() for k, v in self.inputs.items()}
+        if not config["csv_filename"]:
+            self.update_log("⚠️ 请选择一个 CSV 文件！")
+            return
+        config["config_file"] = None
+
+        # 保存一份配置
+        self.save_config()
+
+        self.worker = TrackerWorker(config)
+        self.worker.log_signal.connect(self.update_log)
+        self.worker.alert_signal.connect(self.show_alert)  # 连接弹窗信号
+        self.worker.start()
+        self.update_log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 任务已启动...")
+
+    def stop_tracker(self):
+        if self.worker:
+            self.worker.stop()
+            self.update_log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 任务已停止。")
+
+    def update_log(self, msg):
+        self.log_output.append(msg)
+        self.log_output.moveCursor(self.log_output.textCursor().End)  # 自动滚动到底部
+
+    def show_alert(self, message):
+        # 非阻塞弹窗
+        QMessageBox.information(self, "监控提醒", message)
+
+
+# ================= 程序入口 =================
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())

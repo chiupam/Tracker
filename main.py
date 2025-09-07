@@ -9,6 +9,7 @@ import pandas as pd
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit,
                              QPushButton, QTextEdit, QFileDialog, QHBoxLayout, QMessageBox)
 from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtGui import QIcon
 
 
 # ================= Tracker 后端逻辑 =================
@@ -44,11 +45,14 @@ class Tracker(object):
         headers["comcode"] = comcode
         data = self.data.copy()
         data["registNo"] = registNo
-        response = self.session.post(url, json=data, headers=headers)
-        response.encoding = "utf-8"
-        nodePKVoList = response.json()['data']['nodePKVoList']
-        nodePKVoList.sort(key=lambda x: x['wbusinessCmain']['indate'])
-        return nodePKVoList
+        nodePKVoList = False
+        try:
+            response = self.session.post(url, json=data, headers=headers)
+            response.encoding = "utf-8"
+            nodePKVoList = response.json()['data']['nodePKVoList']
+            nodePKVoList.sort(key=lambda x: x['wbusinessCmain']['indate'])
+        finally:
+            return nodePKVoList
 
     def check_claims(self, nodePKVoList, old_index, new_index):
         node_list = nodePKVoList[old_index:new_index]
@@ -62,39 +66,42 @@ class Tracker(object):
                 '核赔' in str(item['nodeAddVo']['nodeName']) and
                 'stat' in item['nodeAddVo'])
         ]
-        return "核赔完成" if results else None
+        return "核赔完成" if results else False
 
     def update_csv_data(self, logger=print):
-        dtype_mapping = {'报案号': str, 'comcode': str, '节点长度': str, '核赔节点是否有新增': str}
+        dtype_mapping = {'报案号': str, '机构代码': str, '节点长度': str, '核赔状态': str}  # 与csv表头对应映射
         csv_path = self.csv_filename
         df = pd.read_csv(csv_path, encoding='utf-8-sig', dtype=dtype_mapping)
-        updated = False
+        updated, claims = False, False
         for index, row in df.iterrows():
             registNo = str(row['报案号']).strip() if pd.notna(row['报案号']) else ''
-            comcode = str(row['comcode']).strip() if pd.notna(row['comcode']) else ''
-            current_length_str = str(row['节点长度']).strip() if pd.notna(row['节点长度']) else '0'
+            comcode = str(row['机构代码']).strip() if pd.notna(row['机构代码']) else ''
+            current_length_str = str(row['节点长度']).strip() if pd.notna(row['节点长度']) else 0
             nodePKVoList = self.get_state(registNo, comcode)
-            new_length = len(nodePKVoList)
-            current_length = int(current_length_str) if current_length_str.isdigit() else 0
-            if new_length != current_length:
-                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列：{index} -- 报案号：{registNo} -- 机构代码：{comcode} -- 节点长度：{new_length}")
-                claims = self.check_claims(nodePKVoList, current_length, new_length)
-                df.loc[index] = {'报案号': registNo, 'comcode': comcode,
-                                 '节点长度': str(new_length), '核赔节点是否有新增': claims}
-                updated = True
+            if nodePKVoList:
+                new_length = len(nodePKVoList)
+                current_length = int(current_length_str) if current_length_str.isdigit() else 0
+                if new_length != current_length:
+                    updated = True
+                    claims = self.check_claims(nodePKVoList, current_length, new_length)
+                    if claims:
+                        claims = True
+                    logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列: {index} -- 报案号: {registNo} -- 新增节点数: {new_length - current_length} -- 核赔状态: {claims}")
+                    df.loc[index] = {'报案号': registNo, '机构代码': comcode, '节点长度': str(new_length), '核赔状态': claims}
+                else:
+                    logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列: {index} -- 报案号: {registNo} -- 节点数: 无变化")
             else:
-                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列：{index} -- 报案号：{registNo} -- 机构代码：{comcode} -- 节点长度：无变化")
+                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列: {index} -- 报案号: {registNo} -- 请检查鉴权")
             time.sleep(self.interval)
 
         if updated:
             try:
                 df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CSV文件已成功更新并保存！")
-                return True   # 有更新
+                if claims:
+                    logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CSV文件已成功更新并保存！请及时查看有核赔通过的案件情况！")
+                    return True   # 有更新
             except Exception as e:
                 logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 保存文件时出错: {e}")
-        else:
-            logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 没有需要更新的数据")
         return False
 
 
@@ -147,24 +154,49 @@ class MainWindow(QWidget):
         layout = QVBoxLayout()
         self.inputs = {}
 
-        # 中文字段映射
-        fields = {
-            "host": "主机地址",
-            "cookie": "Cookie",
-            "auth": "授权码",
-            "username": "用户名",
-            "usercode": "用户代码",
-            "interval": "每条间隔秒数",
-            "loop_interval": "循环间隔秒数"
-        }
+        # 主机地址
+        hbox_host = QHBoxLayout()
+        hbox_host.addWidget(QLabel("主机地址"))
+        self.host_edit = QLineEdit()
+        hbox_host.addWidget(self.host_edit)
+        layout.addLayout(hbox_host)
+        self.inputs["host"] = self.host_edit
 
-        for key, label in fields.items():
-            hbox = QHBoxLayout()
-            hbox.addWidget(QLabel(label))
-            line_edit = QLineEdit()
-            hbox.addWidget(line_edit)
-            layout.addLayout(hbox)
-            self.inputs[key] = line_edit
+        # Cookie + Authorization
+        hbox_auth = QHBoxLayout()
+        hbox_auth.addWidget(QLabel("Cookie"))
+        self.cookie_edit = QLineEdit()
+        hbox_auth.addWidget(self.cookie_edit)
+        hbox_auth.addWidget(QLabel("Authorization"))
+        self.auth_edit = QLineEdit()
+        hbox_auth.addWidget(self.auth_edit)
+        layout.addLayout(hbox_auth)
+        self.inputs["cookie"] = self.cookie_edit
+        self.inputs["auth"] = self.auth_edit
+
+        # 用户名 + 用户代码
+        hbox_user = QHBoxLayout()
+        hbox_user.addWidget(QLabel("用户名"))
+        self.username_edit = QLineEdit()
+        hbox_user.addWidget(self.username_edit)
+        hbox_user.addWidget(QLabel("用户代码"))
+        self.usercode_edit = QLineEdit()
+        hbox_user.addWidget(self.usercode_edit)
+        layout.addLayout(hbox_user)
+        self.inputs["username"] = self.username_edit
+        self.inputs["usercode"] = self.usercode_edit
+
+        # 每条间隔秒数 + 循环间隔秒数
+        hbox_interval = QHBoxLayout()
+        hbox_interval.addWidget(QLabel("每条间隔秒数"))
+        self.interval_edit = QLineEdit()
+        hbox_interval.addWidget(self.interval_edit)
+        hbox_interval.addWidget(QLabel("循环间隔秒数"))
+        self.loop_edit = QLineEdit()
+        hbox_interval.addWidget(self.loop_edit)
+        layout.addLayout(hbox_interval)
+        self.inputs["interval"] = self.interval_edit
+        self.inputs["loop_interval"] = self.loop_edit
 
         # CSV 文件选择
         hbox_csv = QHBoxLayout()
@@ -177,11 +209,13 @@ class MainWindow(QWidget):
         layout.addLayout(hbox_csv)
         self.inputs["csv_filename"] = self.csv_edit
 
-        # 控制按钮
+        # 控制按钮（同一行）
+        hbox_btn = QHBoxLayout()
         self.start_button = QPushButton("运行")
         self.stop_button = QPushButton("停止")
-        layout.addWidget(self.start_button)
-        layout.addWidget(self.stop_button)
+        hbox_btn.addWidget(self.start_button)
+        hbox_btn.addWidget(self.stop_button)
+        layout.addLayout(hbox_btn)
 
         # 日志窗口
         self.log_output = QTextEdit()
@@ -258,7 +292,18 @@ class MainWindow(QWidget):
 
 # ================= 程序入口 =================
 if __name__ == "__main__":
+    import sys, os
+    from PyQt5.QtGui import QIcon
+
+    def resource_path(relative_path):
+        """获取资源文件路径，兼容 PyInstaller 打包"""
+        if hasattr(sys, "_MEIPASS"):
+            return os.path.join(sys._MEIPASS, relative_path)
+        return os.path.join(os.path.abspath("."), relative_path)
+
     app = QApplication(sys.argv)
     window = MainWindow()
+    app.setWindowIcon(QIcon(resource_path("favicon.ico")))  # 这里就能兼容源码运行和打包运行
     window.show()
     sys.exit(app.exec_())
+

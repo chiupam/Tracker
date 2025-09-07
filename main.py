@@ -13,8 +13,8 @@ from PyQt5.QtGui import QIcon
 
 
 # ================= Tracker 后端逻辑 =================
-class Tracker(object):
-    def __init__(self, auth, cookie, host, username, usercode,
+class Tracker:
+    def __init__(self, auth, cookie, host, username, usercode, regioncode,
                  interval, loop_interval, csv_filename, config_file):
         self.path = os.path.dirname(os.path.abspath(__file__))
         self.Authorization = auth
@@ -22,6 +22,7 @@ class Tracker(object):
         self.host = host
         self.username = username
         self.usercode = usercode
+        self.regioncode = regioncode
         self.interval = interval
         self.loop_interval = loop_interval
         self.csv_filename = csv_filename
@@ -29,79 +30,109 @@ class Tracker(object):
 
         self.session = requests.Session()
         self.headers = {
-            'Cookie': self.cookie,
-            'Authorization': self.Authorization,
-            'sysnum': "CXLP"
+            "Cookie": self.cookie,
+            "Authorization": self.Authorization,
+            "sysnum": "CXLP"
         }
         self.data = {
             "userCodeSession": self.usercode,
             "userNameSession": self.username,
-            "comCodeSession": "44030000"
+            "comCodeSession": f"{str(regioncode)}0000"
         }
 
+    @staticmethod
+    def t():
+        """获取当前时间"""
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     def get_state(self, registNo, comcode):
+        """获取案件的节点信息"""
         url = f"http://{self.host}/claimcar/api/applicationLayer/piccclaim/newFrame/bpm/viewFlowChart"
-        headers = self.headers.copy()
+        headers:dict = self.headers.copy()
         headers["comcode"] = comcode
-        data = self.data.copy()
+        data:dict = self.data.copy()
         data["registNo"] = registNo
-        nodePKVoList = False
+
+        nodePKVoList:list = []
         try:
             response = self.session.post(url, json=data, headers=headers)
             response.encoding = "utf-8"
-            nodePKVoList = response.json()['data']['nodePKVoList']
-            nodePKVoList.sort(key=lambda x: x['wbusinessCmain']['indate'])
+            nodePKVoList = response.json()["data"]["nodePKVoList"]
+            nodePKVoList.sort(key=lambda x: x["wbusinessCmain"]["indate"])
         finally:
             return nodePKVoList
 
-    def check_claims(self, nodePKVoList, old_index, new_index):
+    def check_claims(self, nodePKVoList:list, old_index:int, new_index:int) -> bool:
+        """检查新增节点中是否存在核赔完成的状态"""
         node_list = nodePKVoList[old_index:new_index]
         results = [
-            item['nodeAddVo']['stat']
+            item["nodeAddVo"]["stat"]
             for item in node_list
-            if (isinstance(item, dict) and
-                'nodeAddVo' in item and
-                isinstance(item['nodeAddVo'], dict) and
-                'nodeName' in item['nodeAddVo'] and
-                '核赔' in str(item['nodeAddVo']['nodeName']) and
-                'stat' in item['nodeAddVo'])
+            if (
+                isinstance(item, dict)
+                and "nodeAddVo" in item
+                and isinstance(item["nodeAddVo"], dict)
+                and "nodeName" in item["nodeAddVo"]
+                and "核赔" in str(item["nodeAddVo"]["nodeName"])
+                and "stat" in item["nodeAddVo"]
+            )
         ]
-        return "核赔完成" if results else False
+        return True if results else False
 
     def update_csv_data(self, logger=print):
-        dtype_mapping = {'报案号': str, '机构代码': str, '节点长度': str, '核赔状态': str}  # 与csv表头对应映射
+        """更新CSV文件中的节点信息（仅在发现核赔通过时更新并保存）"""
+        dtype_mapping:dict = {"报案号": str, "承保代码": str, "节点长度": str, "核赔状态": str}
         csv_path = self.csv_filename
-        df = pd.read_csv(csv_path, encoding='utf-8-sig', dtype=dtype_mapping)
-        updated, claims = False, False
+        df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=dtype_mapping)
+
+        updated = False
+        has_claims_update = False
+
         for index, row in df.iterrows():
-            registNo = str(row['报案号']).strip() if pd.notna(row['报案号']) else ''
-            comcode = str(row['机构代码']).strip() if pd.notna(row['机构代码']) else ''
-            current_length_str = str(row['节点长度']).strip() if pd.notna(row['节点长度']) else 0
+            registNo = str(row["报案号"]).strip() if pd.notna(row["报案号"]) else ""
+            comcode = str(row["承保代码"]).strip() if pd.notna(row["承保代码"]) else ""
+            current_length_str = str(row["节点长度"]).strip() if pd.notna(row["节点长度"]) else "0"
+            current_length = int(current_length_str) if current_length_str.isdigit() else 0
+
+            if len(registNo) < 22:
+                logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 报案号不正确，跳过")
+                continue
+
             nodePKVoList = self.get_state(registNo, comcode)
-            if nodePKVoList:
-                new_length = len(nodePKVoList)
-                current_length = int(current_length_str) if current_length_str.isdigit() else 0
-                if new_length != current_length:
-                    updated = True
-                    claims = self.check_claims(nodePKVoList, current_length, new_length)
-                    if claims:
-                        claims = True
-                    logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列: {index} -- 报案号: {registNo} -- 新增节点数: {new_length - current_length} -- 核赔状态: {claims}")
-                    df.loc[index] = {'报案号': registNo, '机构代码': comcode, '节点长度': str(new_length), '核赔状态': claims}
-                else:
-                    logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列: {index} -- 报案号: {registNo} -- 节点数: 无变化")
+            if not nodePKVoList:
+                logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 请检查鉴权")
+                time.sleep(self.interval)
+                continue
+
+            new_length = len(nodePKVoList)
+            if new_length == current_length:
+                logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 节点数: 无变化")
+                time.sleep(self.interval)
+                continue
+            
+            # 有新增节点：仅当发现核赔通过（claim_status 为真）时才更新 DataFrame
+            if self.check_claims(nodePKVoList, current_length, new_length):
+                # 只有在核赔通过时才写入节点长度和核赔状态
+                df.at[index, "节点长度"] = str(new_length)
+                df.at[index, "核赔状态"] = "核赔完成"
+                updated = True
+                has_claims_update = True
+                logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 新增节点数: {new_length - current_length} -- 核赔状态: 核赔完成")
             else:
-                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 序列: {index} -- 报案号: {registNo} -- 请检查鉴权")
+                # 未见核赔通过，仅记录日志（不修改 CSV）
+                logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 新增节点数: {new_length - current_length} -- 节点: 未见核赔通过")
+
             time.sleep(self.interval)
 
         if updated:
             try:
-                df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                if claims:
-                    logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CSV文件已成功更新并保存！请及时查看有核赔通过的案件情况！")
-                    return True   # 有更新
+                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                if has_claims_update:
+                    logger(f"{self.t()} CSV文件已成功更新并保存！请及时查看有核赔通过的案件情况！")
+                    return True
             except Exception as e:
-                logger(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 保存文件时出错: {e}")
+                logger(f"{self.t()} 保存文件时出错: {e}")
+
         return False
 
 
@@ -126,6 +157,7 @@ class TrackerWorker(QThread):
                 self.config['host'],
                 self.config['username'],
                 self.config['usercode'],
+                self.config['regioncode'],
                 int(self.config['interval']),
                 int(self.config['loop_interval']),
                 self.config['csv_filename'],
@@ -174,17 +206,21 @@ class MainWindow(QWidget):
         self.inputs["cookie"] = self.cookie_edit
         self.inputs["auth"] = self.auth_edit
 
-        # 用户名 + 用户代码
+        # 员工名 + 工号 + 公司代码
         hbox_user = QHBoxLayout()
-        hbox_user.addWidget(QLabel("用户名"))
+        hbox_user.addWidget(QLabel("员工名"))
         self.username_edit = QLineEdit()
         hbox_user.addWidget(self.username_edit)
-        hbox_user.addWidget(QLabel("用户代码"))
+        hbox_user.addWidget(QLabel("工号"))
         self.usercode_edit = QLineEdit()
         hbox_user.addWidget(self.usercode_edit)
+        hbox_user.addWidget(QLabel("公司代码"))
+        self.regioncode_edit = QLineEdit()
+        hbox_user.addWidget(self.regioncode_edit)
         layout.addLayout(hbox_user)
         self.inputs["username"] = self.username_edit
         self.inputs["usercode"] = self.usercode_edit
+        self.inputs["regioncode"] = self.regioncode_edit
 
         # 每条间隔秒数 + 循环间隔秒数
         hbox_interval = QHBoxLayout()
@@ -239,7 +275,7 @@ class MainWindow(QWidget):
     def save_config(self):
         """保存配置到当前目录下的 config.json"""
         cfg = {k: v.text().strip() for k, v in self.inputs.items()
-               if k in ["host", "username", "usercode", "interval", "loop_interval", "csv_filename"]}
+               if k in ["host", "username", "usercode", "regioncode", "interval", "loop_interval", "csv_filename"]}
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=4)
@@ -292,9 +328,6 @@ class MainWindow(QWidget):
 
 # ================= 程序入口 =================
 if __name__ == "__main__":
-    import sys, os
-    from PyQt5.QtGui import QIcon
-
     def resource_path(relative_path):
         """获取资源文件路径，兼容 PyInstaller 打包"""
         if hasattr(sys, "_MEIPASS"):

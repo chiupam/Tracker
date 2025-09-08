@@ -1,3 +1,5 @@
 *.spec
 
+tracker.csv
+
 build/

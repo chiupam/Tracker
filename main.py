@@ -19,6 +19,12 @@ class Tracker:
         self.path = os.path.dirname(os.path.abspath(__file__))
         self.Authorization = auth
         self.cookie = cookie
+        host = host.strip()
+        if host.startswith("http://"):
+            if not host.endswith("/"):
+                host += "/"
+        else:
+            host = f"http://{host}/"
         self.host = host
         self.username = username
         self.usercode = usercode
@@ -29,6 +35,14 @@ class Tracker:
         self.config_file = config_file
 
         self.session = requests.Session()
+        self.body = {
+            "comCode": f"{self.regioncode}0000",
+            "queryFlag": "1",
+            "carPageNo": "1",
+            "carPageSize": "50",
+            "noCarPageNo": "1",
+            "noCarPageSize": "50"
+        }
         self.headers = {
             "Cookie": self.cookie,
             "Authorization": self.Authorization,
@@ -44,6 +58,21 @@ class Tracker:
     def t():
         """获取当前时间"""
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def get_comcode(self, registNo:str):
+        """通过报案号获取承保代码"""
+        url = f"http://{self.host}/newFrame/registApi/processQuery"
+        headers:dict = self.headers.copy()
+        data = self.body.copy()
+        data["bpmParam"] = registNo
+
+        comCode = None
+        try:
+            response = self.session.post(url, json=data, headers=headers)
+            response.encoding = "utf-8"
+            comCode = response.json()["data"]["carCaseInfoList"][0]["comCode"]
+        finally: 
+            return comCode
 
     def get_state(self, registNo, comcode):
         """获取案件的节点信息"""
@@ -61,7 +90,7 @@ class Tracker:
             nodePKVoList.sort(key=lambda x: x["wbusinessCmain"]["indate"])
         finally:
             return nodePKVoList
-
+            
     def check_claims(self, nodePKVoList:list, old_index:int, new_index:int) -> bool:
         """检查新增节点中是否存在核赔完成的状态"""
         node_list = nodePKVoList[old_index:new_index]
@@ -74,14 +103,14 @@ class Tracker:
                 and isinstance(item["nodeAddVo"], dict)
                 and "nodeName" in item["nodeAddVo"]
                 and "核赔" in str(item["nodeAddVo"]["nodeName"])
-                and "stat" in item["nodeAddVo"]
+                and item["nodeAddVo"]["stat"] == "已经处理"
             )
         ]
         return True if results else False
 
     def update_csv_data(self, logger=print):
         """更新CSV文件中的节点信息（仅在发现核赔通过时更新并保存）"""
-        dtype_mapping:dict = {"报案号": str, "承保代码": str, "节点长度": str, "核赔状态": str}
+        dtype_mapping:dict = {"报案号": str, "节点长度": str, "核赔状态": str}
         csv_path = self.csv_filename
         df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=dtype_mapping)
 
@@ -90,7 +119,6 @@ class Tracker:
 
         for index, row in df.iterrows():
             registNo = str(row["报案号"]).strip() if pd.notna(row["报案号"]) else ""
-            comcode = str(row["承保代码"]).strip() if pd.notna(row["承保代码"]) else ""
             current_length_str = str(row["节点长度"]).strip() if pd.notna(row["节点长度"]) else "0"
             current_length = int(current_length_str) if current_length_str.isdigit() else 0
 
@@ -98,12 +126,12 @@ class Tracker:
                 logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 报案号不正确，跳过")
                 continue
 
-            nodePKVoList = self.get_state(registNo, comcode)
-            if not nodePKVoList:
+            comcode = self.get_comcode(registNo)
+            if not comcode:
                 logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 请检查鉴权")
-                time.sleep(self.interval)
                 continue
 
+            nodePKVoList = self.get_state(registNo, comcode)
             new_length = len(nodePKVoList)
             if new_length == current_length:
                 logger(f"{self.t()} 序列: {index} -- 报案号: {registNo} -- 节点数: 无变化")
@@ -134,6 +162,80 @@ class Tracker:
                 logger(f"{self.t()} 保存文件时出错: {e}")
 
         return False
+    
+    def clean_fix(self, logger=print):
+        """清理CSV：
+        1. 修复只有报案号但缺少两个逗号的行
+        2. 删除重复报案号，优先保留有核赔状态的记录
+        """
+        csv_path = self.csv_filename
+
+        # 先修复格式：保证每行至少有3个字段
+        try:
+            fixed_lines = []
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # 如果只有一个字段，补齐两个逗号
+                    if "," not in line:
+                        fixed_lines.append(f"{line},,")
+                    else:
+                        parts = line.split(",")
+                        # 确保至少有3列
+                        while len(parts) < 3:
+                            parts.append("")
+                        fixed_lines.append(",".join(parts))
+            # 覆盖写回，保证格式正确
+            with open(csv_path, "w", encoding="utf-8-sig") as f:
+                f.write("\n".join(fixed_lines))
+        except Exception as e:
+            logger(f"{self.t()} 修复格式时出错: {e}")
+            return False
+
+        # 再读入DataFrame
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
+        except Exception as e:
+            logger(f"{self.t()} 打开CSV失败: {e}")
+            return False
+
+        if "报案号" not in df.columns or "核赔状态" not in df.columns:
+            logger(f"{self.t()} CSV缺少必要列: 报案号 / 核赔状态")
+            return False
+
+        drop_indices = []
+
+        grouped = df.groupby("报案号")
+        for registNo, group in grouped:
+            if len(group) <= 1:
+                continue
+            keep_index = None
+            for idx, row in group.iterrows():
+                status = str(row["核赔状态"]).strip()
+                if status:  # 优先保留有核赔状态的
+                    keep_index = idx
+                    break
+            if keep_index is None:
+                keep_index = group.index[0]  # 如果都没有核赔状态，保留第一行
+
+            for idx in group.index:
+                if idx != keep_index:
+                    drop_indices.append(idx)
+
+        if drop_indices:
+            df = df.drop(drop_indices).reset_index(drop=True)
+            try:
+                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                logger(f"{self.t()} 清理完成：修复格式 + 删除 {len(drop_indices)} 行重复数据")
+                return True
+            except Exception as e:
+                logger(f"{self.t()} 保存清理结果失败: {e}")
+                return False
+        else:
+            logger(f"{self.t()} 清理完成：修复格式，无重复报案号")
+            return True
 
 
 # ================= 后台线程封装 =================
@@ -158,7 +260,7 @@ class TrackerWorker(QThread):
                 self.config['username'],
                 self.config['usercode'],
                 self.config['regioncode'],
-                int(self.config['interval']),
+                float(self.config['interval']),
                 int(self.config['loop_interval']),
                 self.config['csv_filename'],
                 self.config['config_file']
@@ -249,8 +351,10 @@ class MainWindow(QWidget):
         hbox_btn = QHBoxLayout()
         self.start_button = QPushButton("运行")
         self.stop_button = QPushButton("停止")
+        self.fix_button = QPushButton("修复")   # ✅ 新增按钮
         hbox_btn.addWidget(self.start_button)
         hbox_btn.addWidget(self.stop_button)
+        hbox_btn.addWidget(self.fix_button)     # ✅ 添加到布局
         layout.addLayout(hbox_btn)
 
         # 日志窗口
@@ -262,6 +366,7 @@ class MainWindow(QWidget):
         self.worker = None
         self.start_button.clicked.connect(self.start_tracker)
         self.stop_button.clicked.connect(self.stop_tracker)
+        self.fix_button.clicked.connect(self.run_clean_fix)   # ✅ 绑定事件
 
         # 程序启动时加载 config.json
         self.config_path = os.path.join(os.path.dirname(sys.argv[0]), "config.json")
@@ -312,6 +417,28 @@ class MainWindow(QWidget):
         self.worker.start()
         self.update_log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 任务已启动...")
 
+    def run_clean_fix(self):
+        """执行 Tracker.clean_fix"""
+        config = {k: v.text().strip() for k, v in self.inputs.items()}
+        if not config["csv_filename"]:
+            self.update_log("⚠️ 请先选择 CSV 文件！")
+            return
+
+        # 创建临时 Tracker 实例，调用 clean_fix
+        tracker = Tracker(
+            auth=config.get("auth", ""),
+            cookie=config.get("cookie", ""),
+            host=config.get("host", ""),
+            username=config.get("username", ""),
+            usercode=config.get("usercode", ""),
+            regioncode=config.get("regioncode", ""),
+            interval=int(config.get("interval", "1") or 1),
+            loop_interval=int(config.get("loop_interval", "60") or 60),
+            csv_filename=config["csv_filename"],
+            config_file=None
+        )
+        tracker.clean_fix(logger=self.update_log)
+
     def stop_tracker(self):
         if self.worker:
             self.worker.stop()
@@ -339,4 +466,4 @@ if __name__ == "__main__":
     app.setWindowIcon(QIcon(resource_path("favicon.ico")))  # 这里就能兼容源码运行和打包运行
     window.show()
     sys.exit(app.exec_())
-
+    
